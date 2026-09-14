@@ -16,9 +16,10 @@ def main():
     p.add_argument('--decoder', required=True, help='decoder .rknn or .onnx')
     p.add_argument('--out-wav', required=True)
     p.add_argument('--target', default='rk3588')
+    p.add_argument('--text', default=TEXT)
     args = p.parse_args()
 
-    input_ids, attn_mask = preprocess_input(TEXT, vocab, MAX_LENGTH)
+    input_ids, attn_mask = preprocess_input(args.text, vocab, MAX_LENGTH)
 
     enc = init_model(args.encoder, args.target, None)
     dec = init_model(args.decoder, args.target, None)

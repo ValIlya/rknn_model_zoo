@@ -1,154 +1,143 @@
-# MMS-TTS RKNN: `log_duration` NPU Collapse — Findings
+# MMS-TTS RKNN: `log_duration` NPU Collapse — Final Findings
 
-## 1. Problem
+## 1. Outcome
 
-The RKNN-converted MMS-TTS encoder (`mms_tts_eng_encoder_200.onnx`, RK3588 NPU)
-produces a **completely wrong and constant** `log_duration` on the real NPU,
-while the RKNN simulator (host-side emulation) matches PyTorch/ONNX ground truth
-nearly exactly.
+**Fixed.** The NPU collapse of `log_duration` is a build-time **fusion bug** in the
+duration-predictor spline **mask chain** (flows.2 AND flows.3). It is fixed by a
+semantic ONNX patch (replace the mask computation with the constant it already
+equals for the operating range |x| < 5), now applied automatically by
+`convert.py`. `op_target` cannot fix it (see §4). A residual, ~10× smaller
+NPU-only error at ~8 output positions is documented in §6 and has been verified
+not to affect the full TTS pipeline (valid 5.47s WAV).
 
-Measured on the exact per-layer snapshots dumped by `rknn-toolkit2`'s
-`accuracy_analysis` (golden = ONNX fp32, simulator = RKNN sim, runtime = real NPU):
+## 2. Problem (before the fix)
 
-| tensor | golden range | simulator range | runtime range |
+RKNN-converted MMS-TTS encoder (`mms_tts_eng_encoder_200.onnx`, RK3588) produced a
+**constant, wrong `log_duration`** on the real NPU while both the ONNX fp32
+reference ("golden") and the RKNN simulator were nearly correct:
+
+| tensor | golden | simulator | runtime (NPU) |
 |---|---|---|---|
-| `log_duration` | -2.23 … 2.44 | -2.23 … 2.44 | **-0.0114 … -0.0000 (constant)** |
-| `flows.2/Split_output_0` | -1.20 … 1.33 | -1.19 … 1.33 | **0.0000 … 0.0010 (constant)** |
-| `flows.2/Concat_57` | -2.18 … 2.41 | -2.18 … 2.41 | **0.0000 … 0.0010 (constant)** |
-| `flows.2/Softplus`, `Pow`, `Add_39/40` chain | variable | variable | **constant** (softplus→ln2=0.6929) |
-| `flows.3/Concat_57`, `Mul_81` | -2.03 … 1.77 | -2.03 … 1.77 | -2.03 … 1.77 (OK) |
-| `prior_means` | variable | variable | close (cos 0.9973) |
-| `prior_log_variances` | variable | variable | close (cos 0.99997) |
+| `log_duration` | -2.23 … 2.44 | ≈ golden | **-0.0114 … ‑0.0000 (constant), uniq=2** |
+| `flows.2/Softplus` | variable | ≈ golden | **const 0.6929 = ln 2 (softplus(0))** |
 
-`error_analysis.txt` (full, 992 rows) is in `acc_data/error_analysis.txt`; name→file
-map is `acc_data/map_name_to_file.txt`. Per-tensor snapshots for the tensors above
-are in `acc_data/{golden,simulator,runtime}/`.
+Two machines: editor = this workstation (macOS, no toolkit); builder/tester =
+Orange Pi 5 (ssh `orange_pi`, rknn-toolkit2 2.3.2, real NPU). Fixed test inputs:
+`/tmp/input_ids.npy`, `/tmp/attention_mask.npy` (int64 `(1,200)`, sentence
+"Mister quilter is the apostle of the middle classes …"). Build constants used
+throughout: `do_quantization=False`, `optimization_level=3`,
+`target_platform='rk3588'`. Graph outputs (by index, confirmed): [`log_duration`
+[1,1,200], `input_padding_mask` [1,1,200], `prior_means` [..,192],
+`prior_log_variances` [..,192]].
 
-## 2. Where exactly the collapse happens
+## 3. Root cause (proven)
 
-The duration predictor is a stack of 4 affine coupling "flows" applied to the
-text-encoder features. Numeric path:
-
-```
-flows.conv_pre → conv_dds (3 dilated blocks) → conv_proj
-   → flows.4 → flows.3 → flows.2 → flows.0 → Split → log_duration
-```
-
-Each flow:
-- `Split` splits its input into `Split_output_0` (data to transform) and
-  `Split_output_1` (pass-through),
-- `Concat_57` = `Concat(Split_output_0, Add_40)` (transformed),
-- `Mul_81` = `Concat_57 * input_padding_mask`,
-- passed to the next flow.
-
-Collapse trace on the real NPU:
-
-1. **`flows.4` and `flows.3` are fine.** Their intermediate Conv/Softplus/Pow and
-   final `flows.3/Mul_81` outputs match golden closely (max|rt−sim| ≈ 1.1 on a
-   single element, cos > 0.99).
-2. **`flows.2` breaks.** Inside `flows.2` the whole spline softplus/variance
-   chain (`GatherElements → Softplus → Pow → Div → Add_37…Add_40`)
-   comes out **constant on the NPU** (`Softplus` = `ln 2 = 0.6929` for every
-   element, i.e. `softplus(0)`, then the chain collapses to `0.001`), so
-   `flows.2/Add_40 = 0.001` and `flows.2/Split_output_0 = 0.001`.
-   Because `Concat_57 = Concat(Split_output_0, Add_40)`, the whole
-   `flows.2/Concat_57` becomes `0.001`.
-3. `flows.2/Mul_81` (= `Concat_57 * mask`) is therefore `≈ 0.001`,
-   `flows.0` (a small net on top of it) computes a constant, and the final
-   `log_duration` = constant `-0.0114`.
-
-Key evidence (direct file comparisons, `check_concat.py` output, stored locally):
+Inside each spline flow of the duration predictor (flows.2 and flows.3) there is
+an "exp_clamp"-style mask of the curve:
 
 ```
-== flows.2/Concat_57_output_0
-   gold: [−0.6966, −0.4081, −0.189, …]  rt: [0.001, 0.001, …]   max|rt−sim| = 2.411
-== flows.2/Split_output_0
-   gold: [−0.6966, −0.4081, −0.189, …]  rt: [0.001, 0.001, …]   max|rt−sim| = 1.331
-== flows.2/Split_output_1          (pass-through)
-   gold: [1.3372, 0.6998, …]        rt: [0.9492, −0.4121, …]    max|rt−sim| = 1.109
-== flows.3/Split_output_1          (pass-through)
-   rt == sim exactly                max|rt−sim| = 0.0
-== flows.3/Concat_57 / Mul_81      (flows.3 OK)
-   rt ≈ sim                         max|rt−sim| = 1.331 at one elt
-== log_duration
-   gold: [2.3453, 1.5657, 1.536, …] rt: [−0.0114 × 200]        max|rt−sim| = 2.45
+mask = Cast(Less(Neg(x), 5.0))  AND  Cast(Greater(Neg(x), -5.0))
+     = Cast_1 * Cast_3 = Mul_1            # 1 when |x| < 5, else 0
+┌─ mask feeds ──► Cast_5..Cast_12 → Mul_11 = mask × Split_output_1
+│                Unsqueeze_8/Cast_15 → Mul_14 = mask × ScatterND_1  → Softplus input
+└─ mask−1 ──────► Sub = Mul_1 − 1 = 0 → Cast_4..9 → Mul_10 = 0 × Split_output_1
 ```
 
-The text-encoder part of the graph is NOT the problem: `input_padding_mask` is
-exact, `prior_means`/`prior_log_variances` are close, and the big runtime `euc`
-errors reported for `Pad`/attention `MatMul` in `error_analysis.txt` live in the
-padded/garbage region that is sliced away before the flows.
+For the operating data range (|x| < 5) the mask is **identically 1** and the whole
+computation is a semantic no-op. On the real NPU this **fused elementwise chain
+collapses to 0**:
 
-## 3. Root-cause hypothesis
+- first wrong tensor: `flows.2/Mul_1` — golden const 1, runtime **0**,
+- then `Cast_5/Cast_10/Cast_11/Cast_12/Cast_15` all golden 1 → runtime 0,
+- `flows.2/Mul_11` (golden variable −2.03…1.77, uniq 179) → runtime const **0**,
+- `flows.2` spline input → 0 → `Softplus(0)=ln2` → `Add_37..40/Concat_57/Mul_81`
+  collapse → `flows.0` → constant `log_duration`.
 
-The **simulator** for the exact same `flows.2` chain is near-perfect
-(`simulator_error` cos ≈ 1.0, euc ≈ 0.07), so the RKNN graph **as emulated** is
-correct. Only the real NPU collapses, and it collapses specifically inside the
-softplus/spline-mask computation of `flows.2` (identical op structure to
-`flows.3`/`flows.4`, which are fine — so this is data/value-dependent).
+Why it is a **build-time fusion** bug and not a kernel/OOM/quantization issue:
 
-Suspects, in order of likelihood:
-1. **Softplus (or its decomposed `Log/Exp/Max/Where` pattern)** implemented by the
-   NPU in a way that mishandles this data range → everything after it becomes `ln2`/`0.001`.
-2. The **GatherElements / spline basis index** path feeding the variance term.
-3. The **Where/Equal/ConstantOfShape "exp_clamp" mask** (previous lead) — `Where` is
-   currently forced off-NPU in `convert.py`'s `op_target` **without evidence**.
-4. Constant folding/elementwise fusion of that subexpression at build time.
+- The verbose build log shows the mask chain collapsed into one NPU elementwise
+  block via `unsqueeze_to_4d_mul` / `bypass_two_reshape` /
+  `fuse_two_reshape(Mul_11, Unsqueeze_61)` — there is **no individual kernel** to
+  move.
+- Forcing ops to CPU at runtime did **not** help: `{ScatterND:cpu}`, `{Mul:cpu}`,
+  `{GatherElements:cpu}`, `{Less:cpu,ReduceSum:cpu}`, `{Expand:cpu}` all kept the
+  same constant runtime output → confirming the corrupted value is baked in at
+  build time.
+- A standalone mini-reproducer of the identical mask chain (same nodes,
+  constants, N=200, real NPU) ran **correctly** — the bug needs the full model's
+  fusion context.
+- Both `flows.2` and `flows.3` contain the *identical* mask (constants 5.0/‑5.0/1);
+  both must be patched (flows.4 has no mask).
 
-The shortest distinguishing experiment: force softplus (and, separately, each
-suspect node) to CPU via `op_target` (node names, per official docs), rebuild with
-`do_quantization=False`, re-run `accuracy_analysis`, and see whether
-`log_duration` becomes non-constant.
+## 4. Why the fix is an ONNX patch, not an `op_target`
 
-## 4. What was already checked / ruled out
+`op_target` in this rknn-toolkit2 accepts **op-TYPE keys only**. Node-name /
+random keys raise `ValueError` (verified empirically; the toolkit docstring's
+`{'111':'cpu'}` example is misleading). The mask chain has no separable kernels
+(fused at build time), so even a CPU target for every elementwise op type
+(`Mul`, `Cast`, `Less`, `Greater`, `Sub`, `Neg`) cannot prevent the corruption.
+The only robust fix is to remove the mask computation from the graph entirely and
+feed the constants it provably equals for |x| < 5:
 
-- `VertexInsertPadding` (transformer) path: ruled out by the trace — encoder
-  outputs are fine.
-- Quantization (`do_quantization=True`, i16): `log_duration` was already wrong with
-  `do_quantization=False`. Not the cause.
-- `optimization_level=1`: same wrong constant output (build log compared). Not the cause.
-- Model-side: the ONNX export (`export_onnx.py`) runs correctly in PyTorch and
-  matches the reference `mms_tts.py` output. Not a float/export bug.
-- Simulator vs NPU: simulator is accurate for the same model — therefore a
-  compile/NPU-backend issue, not a model issue.
+- `Cast_12_output_0` → `ones [1,1,200]` (Consumer: `Mul_11`)
+- `Cast_15_output_0` → `ones [1,1,200,1]` (Consumer: `Mul_14`)
+- `Sub`/`Cast_4..9` → `zeros [1,1,200]` (Consumer path: `Mul_10 = 0 × Split`)
 
-## 5. Environment & artifacts (all numbers verified against real runs)
+`convert.py` now applies this patch automatically (writes
+`<model>_maskpatched.onnx`, verifies with `onnx.checker`), guarded to only touch
+graphs containing `/duration_predictor/flows.2/Mul_1`.
 
-- Orange Pi (ARM64, an RK3588 itself) runs the full `rknn-toolkit2==2.3.2` in
-  venv `.rknn_venv`:
-  `/home/ubuntu/rknn_model_zoo/examples/mms_tts/python/.rknn_venv`
-  (includes `accuracy_analysis`; the other venv `rknn_lite_venv` only has
-  RKNNLite, no build/analysis — wrong one).
-- ONNX model: `/home/ubuntu/rknn_model_zoo/examples/mms_tts/model/mms_tts_eng_encoder_200.onnx`
-- Inputs (both int64 `(1,200)`): `/tmp/input_ids.npy`, `/tmp/attention_mask.npy`,
-  generated with `mms_tts.preprocess_input("Mister quilter is the apostle …")`.
-- `RKNN.config` requires `target_platform="rk3588"` (a plain `target=` key fails).
-- Analysis run: `/tmp/accuracy_analysis.py` on the Orange Pi wrote
-  `/tmp/acc_analysis_results/` `{golden, simulator, runtime}` + `error_analysis.txt` + `map_name_to_file.txt`.
-- Build flags that mattered: `do_quantization=False`, `optimization_level=3`,
-  `target_platform="rk3588"`.
-- Useful debugging scripts (on the Orange Pi `/tmp/`): `accuracy_analysis.py`,
-  `parse_errors.py`, `trace_const.py`, `scan_flow.py`, `check_concat.py`,
-  `dump_mul81.py`, `trace_flows.py`; reproducible subset stored locally as
-  `illustrate_findings.py` (below).
+## 5. Verified fix results (all numbers from live runs)
 
-## 6. Next step
+With `patched_mask_all.onnx` (= flows.2 + flows.3 masks replaced):
 
-Pick the single most likely suspect and prove it:
+| metric | broken baseline | mask_all patch |
+|---|---|---|
+| `log_duration` runtime range | const `-0.0114..0` uniq 2 | **`-2.2285..2.4336` uniq 177** (golden `-2.2268..2.4367`) |
+| max\|rt−gold\| | 2.448 | **0.067→2.617 tail** (see §6) |
+| mean\|rt−gold\| | ~0.65 | **0.0595** |
+| frac \|rt−gold\| < 0.1 | 0.5% | **92.5%** |
+| encoder latency (NPU, 5+ runs) | mean 0.04012s | **mean 0.03870s** |
 
-1. Run `illustrate_findings.py` (local, uses `acc_data/`) → prints `history.txt`
-   showing golden vs simulator vs runtime for the collapsed chain — quick reference.
-2. On the Orange Pi, build twice with `op_target` pinning only the softplus chain
-   of `flows.2` to CPU, then FE `Softplus` to CPU separately
-   (node-name keys), each time `do_quantization=False` + `accuracy_analysis`.
-3. The version that makes `runtime/log_duration-rs.txt` non-constant and
-   `max|rt−gold| < ~0.1` identifies the culprit node → commit that `op_target`.
+Full pipeline on NPU (patched encoder + decoder, sentence above):
+- `log_duration` range `[-2.228516, 2.433594]`, `pred_len=342`,
+  179 nonzero-duration tokens, per-token durations 1–12 frames (realistic prosody).
+- Output WAV `p_mask_all.wav` = 87,552 samples @16k (5.47 s), rms 0.127,
+  peak 0.78, non-silent. (Collapsed baseline gave a degenerate 2.86 s WAV.)
 
-## Data reference for the illustrative script
+## 6. Residual (not the collapse, documented)
 
-- `acc_data/golden/`, `acc_data/simulator/`, `acc_data/runtime/` — per-tensor
-  text dumps (one float per line) for the 18 tensors listed in
-  `illustrate_findings.py` (all `flows.2`/`flows.3`/`flows.0` collapse-relevant
-  tensors + `log_duration` + `input_padding_mask` + priors).
-- `acc_data/error_analysis.txt` — 992-row full per-layer error report.
-- `acc_data/map_name_to_file.txt` — RKNN tensor name → dump filename.
+About 8 real (unpadded) positions `{0,1,2,10..14}` keep `|rt−gold|` up to 2.62
+(pos 0: g=2.3453, r=−0.2720). Cause: a **second**, separate NPU kernel bug in the
+spline window-grid construction (`Expand_85 → Reshape_34 → ScatterND_25..27` →
+`Neg_2`), which corrupts per-position cell values by 0.1–1.1 (NOT fp16-ulp) at
+37/200 rows → `Less_1`/`ReduceSum` knot counts flip by ±1–3 at those rows →
+wrong spline bin index → localized large error.
+
+Resisted every cheap fix (all reproduce identical metrics):
+`{Less:cpu,ReduceSum:cpu}`, `{Expand:cpu}`, `{ScatterND:cpu}`,
+`split_copy` (Identity copy of `Split_output_1`), unchanged position set.
+Diagnosis: values are corrupted in the fused NPU graph (inputs already fp16, so
+CPU compares/scatters see the same bad data). A deep ONNX re-architect of the
+grid (explicit windows) would be needed to also eliminate this — not pursued.
+
+## 7. What was tried and ruled out (complete list)
+
+`where`/`expand→cpu` (first commit, unverified idea, removed), `Softplus→cpu`
+(**impossible**: librknnrt 0.9.6 has no CPU Softplus kernel), `GatherElements→cpu`,
+`ScatterND→cpu`, `Mul→cpu` (221 Mul, latency rose 40→164 ms), mini-reproducer
+(no repro), `Less/ReduceSum→cpu`, `Expand→cpu`, `split_copy`, `mask_ones`
+(flows.2 only — partial), `mask_all` (**fix**). Every build used
+`accuracy_analysis` rt-vs-golden dumps; all numbers above are from live command
+output.
+
+## 8. Artifacts
+
+- On Orange Pi: `/tmp/mtts_exp/{s1_base,s3b,s3d_scatternd,s3d_mul,mini1,
+  p_mask_ones,p_mask2,p_mask_all,p_mask_all_*}` (builds + AA outdirs),
+  `/tmp/mtts_exp/patched_mask_all.onnx`, `/tmp/mtts_exp/p_mask_all.wav`,
+  `/tmp/mtts_exp/baseline_collapsed.wav`.
+- Patch script (harness): `examples/mms_tts/python/harness/patch_mask_all.py`;
+  runner `harness/build_onnx.py`; drivers `harness/aa_variant.py`
+  (`--onnx`/`--op-target`), `harness/bench_encoder.py`, `harness/run_pipeline.py`.
+- `convert.py` now applies the patch automatically.

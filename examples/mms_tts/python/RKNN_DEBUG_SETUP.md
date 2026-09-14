@@ -68,19 +68,34 @@ ssh orange_pi 'cd ~/rknn_model_zoo/examples/mms_tts/python && source .rknn_venv/
   `{golden, simulator, runtime}/` per-tensor snapshots (one float per line,
   flattened) plus `error_analysis.txt` and `map_name_to_file.txt`.
 - `config()` in this toolkit version accepts `op_target=` (confirmed via
-  `inspect.signature`); docstring says `{'111':'cpu', ...}` — i.e. the docs are
-  ambiguous about key format. **Key semantics were validated empirically** (see
-  SESSION LOG / experiment notes). Keys are ONNX node names, NOT op types.
+  `inspect.signature`); the docstring example `{'111':'cpu'}` is misleading.
+  **Key semantics validated empirically:** keys are **op TYPES only**
+  (e.g. `{"Mul":"cpu"}`). Any node-name / random key raises `ValueError`. (The
+  older setup doc's "node names" claim was wrong.)
 - `RKNN(verbose=True, verbose_file=...)` is available for build logs.
 - `do_quantization=False` + `optimization_level=3` +
   `target_platform='rk3588'` is the baseline used for all analysis runs.
-- Suspect node names (exact, confirmed by graph dump):
+- Suspect node names (exact, confirmed by graph dump) — **all of these proved to be
+  false leads** except the mask chain (§ below):
   - `/duration_predictor/flows.2/Softplus` (single Softplus in flows.2)
   - `/duration_predictor/flows.2/GatherElements`, `GatherElements_1`
     … `GatherElements_6` (7 total)
   - `/duration_predictor/flows.2/Pow`, `/duration_predictor/flows.2/Div_3`
   - `/duration_predictor/flows.2/Add_37`, `Add_38`, `Add_39`, `Add_40`
   - `/duration_predictor/flows.2/Concat_57`, `/duration_predictor/flows.2/Mul_81`
+- **THE root-cause chain** (read `FINDINGS.md` for the full story):
+  flows.2 **and** flows.3 spline **mask chain**
+  (`Less/Greater → Cast/Cast_1/2/3 → Mul_1 → Cast_5..12/Cast_15`; constants
+  5.0 / −5.0 / 1) is fused into one NPU elementwise block at build time
+  (`unsqueeze_to_4d_mul` / `fuse_two_reshape(Mul_11,…)`) and collapses to **0**
+  on the real NPU (Mul_1: golden 1 → rt 0; Mul_11 golden var → rt 0; Softplus
+  input 0 → ln2). Fix = ONNX patch replacing the mask with the constant it
+  equals for |x|<5 (auto-applied by `convert.py`). `op_target` CANNOT fix it.
+- Residual (documented, smaller): spline window-grid construction
+  (`Expand_85→Reshape_34→ScatterND_25..27→Neg_2`) corrupts 37/200 rows by
+  0.1–1.1 → knot-count (`ReduceSum`) flips at {0,1,2,10..14} → max|rt−gold|≈2.6
+  at those 8 positions (mean 0.0595, 92.5% < 0.1). Immune to `op_target` moves
+  and `split_copy`. Not the collapse; full pipeline produces valid 5.47s WAV.
 
 ## 4. File inventory
 
@@ -88,7 +103,7 @@ Under `examples/mms_tts/python/`:
 
 | File | Purpose |
 |---|---|
-| `convert.py` | Official conversion script. Builds `model/mms_tts_eng_encoder_200.rknn`. **op_target here must stay free of UNVERIFIED entries.** |
+| `convert.py` | Official conversion script. Builds `model/mms_tts_eng_encoder_200.rknn`. **Now applies the spline mask patch automatically** (auto-creates `*_maskpatched.onnx`). op_target is NOT used (the fusion bug is patched in the ONNX, not at runtime). |
 | `mms_tts.py` | Full TTS pipeline (encoder → `middle_process` → decoder → wav). Reference `run_encoder`/`run_decoder` handle both `.rknn` and `.onnx`. |
 | `export_onnx.py`, `modeling_vits_for_export_onnx.py` | PyTorch → ONNX export. Not implicated in this bug. |
 | `trace_graph.py` | ONNX graph walker; prints inputs/outputs/nodes + backward path to each output. |
@@ -106,10 +121,12 @@ Under `examples/mms_tts/python/`:
 On the Orange Pi (venv active):
 
 ```bash
-# 1) Run one build+analysis variant. op_target is a JSON dict of node->"cpu".
+# 1) Run one build+analysis variant. op_target is a JSON dict of OP-TYPE->"cpu"
+#    (node-name keys raise ValueError; see app note in §3).
 python /home/ubuntu/rknn_model_zoo/examples/mms_tts/python/harness/aa_variant.py \
   --outdir /tmp/exp_s3a \
-  --op-target '{"duration_predictor/flows.2/Softplus":"cpu"}'
+  --onnx /tmp/mtts_exp/patched_mask_all.onnx \
+  --op-target '{"Mul":"cpu"}'
 
 # 2) Summarize it:
 python /home/ubuntu/rknn_model_zoo/examples/mms_tts/python/harness/summarize.py /tmp/exp_s3a
@@ -139,14 +156,13 @@ Key metrics to look for after each variant:
 
 1. Every reported number must come from a command run in *this* session;
    paste command + raw output together. Anything not run = "NOT VERIFIED".
-2. `op_target` keys must be **actual node names in this graph** (confirmed via
-   graph dump), never op-type strings — op-type keys were never shown to map in
-   this version's API.
-3. Change exactly ONE variable per rebuild (one node to CPU, `do_quantization`,
-   or `optimization_level`), then re-run `accuracy_analysis` and compare
-   `runtime/log_duration-rs.txt` vs `golden/log_duration-rs.txt`.
-4. Avoid trusting earlier, unverified claims (read `softplus_fix.md` only as a
-   cautionary tale).
+2. `op_target` keys must be **op types in this graph** (e.g. `{"Mul":"cpu"}`),
+   never node names — node-name keys raise `ValueError` (verified).
+3. Change exactly ONE variable per rebuild, then re-run `accuracy_analysis` and
+   compare `runtime/log_duration-rs.txt` vs `golden/log_duration-rs.txt`.
+4. Since the root cause is a **build-time fusion** bug, `op_target` alone cannot
+   fix it — graph surgery (`harness/patch_mask_all.py`) is required; verify with
+   `accuracy_analysis` + `bench_encoder.py`.
 
 ## 7. Known gotchas
 
@@ -180,16 +196,45 @@ Key metrics to look for after each variant:
 - Built the harness scripts (`harness/aa_variant.py`, `summarize.py`,
   `bench_encoder.py`, `run_pipeline.py`) — they run with the Orange Pi venv.
 
-### (to be filled in as steps 0b–6 run)
+### Session log (append here as experiments run)
 
-## 10. Next actionable TODO
+- Confirmed graph outputs order, `config()`/`accuracy_analysis()`/`RKNN(verbose=...)`
+  signatures, and exact flows.2 node names on the Orange Pi (see tool outputs in
+  session history).
+- Built the harness scripts (`harness/aa_variant.py`, `summarize.py`,
+  `bench_encoder.py`, `run_pipeline.py`) — they run with the Orange Pi venv.
 
-1. Probe `op_target` semantics with a nonsense key (document whether unknown
-   keys warn/error).
-2. Re-run step 1 (baseline, no `op_target`) and confirm the collapse reproduces.
-3. Run variants 3a/3b/3c (+ 3d if needed) until `log_duration` runtime is
-   non-constant with `max|rt-gold| < 0.1`.
-4. Rule out fusion via verbose build log grep for the winning node(s).
-5. Full pipeline WAV + phoneme-order check vs CPU reference.
-6. Latency delta measurement.
-7. Write final `op_target` into `convert.py` and report.
+- **op_target key semantics validated:** keys are op TYPES (e.g. `{"Mul":"cpu"}`);
+  node-name keys raise `ValueError`.
+- **Softplus→cpu: BLOCKED** — `librknnrt.so 0.9.6` has no CPU Softplus kernel.
+- **Baseline (step 1) reproduced:** rt `log_duration` const −0.0114…0, uniq 2,
+  max|rt−gold| = 2.448.
+- **Step 2:** removed old `where/expand→cpu`; `op_target` now only op-type keys.
+  Baseline latency (NPU): mean 0.04012 s (8 runs).
+- **Trace dump** (direct NPU dumps): `Mul_11` (flows.2) golden variable → rt const 0;
+  `Mul_1` (golden const 1) → rt 0 → root cause in the mask chain.
+- **ScatterND→cpu, Mul→cpu:** no fix; build-log confirmed fusion
+  (`unsqueeze_to_4d_mul`, `fuse_two_reshape(Mul_11, Unsqueeze_61)`).
+- **Mini-reproducer** (`mini_repro.py`, standalone mask chain, real NPU): does NOT
+  reproduce → fusion context required.
+- **mask_ones patch** (flows.2 only): `log_duration` becomes non-constant
+  (−2.09…1.76), mean 0.28, frac<0.1=0.30; flows.3 still collapses → patch flows.3
+  too.
+- **mask_all patch** (flows.2+3): `log_duration` range −2.2285…2.4336
+  (golden −2.2268…2.4367); max|rt−gold| = 2.617, mean 0.0595, frac<0.1 = 0.925;
+  latency mean 0.03870 s.
+- **Boundary-residual chase** (≤8 real positions): `Neg_2` grid differs by 0.1–1.1
+  at 37 rows → `ReduceSum` count flips; resisted `{Less,ReduceSum:cpu}`,
+  `{Expand:cpu}`, `{ScatterND:cpu}`, `split_copy`.
+- **Full TTS pipeline** (patched encoder + decoder .rknn): 179 nonzero-duration
+  tokens, per-token durations 1–12, WAV 87,552 samples @16k (5.47 s, rms 0.127).
+- **convert.py** now applies mask patch automatically before building.
+
+## 10. Current state
+
+**Collapse fully fixed.** The fix is in `convert.py` (auto-applies the spline mask
+patch to `*_maskpatched.onnx` before conversion). Encoder-only NPU latency
+unchanged (38.7 ms). Full TTS pipeline verified producing valid 5.47 s WAV with
+realistic per-token durations (1–12 frames, 179 nonzero). A ~10× smaller residual
+NPU-only error at ~8 output positions is documented in `FINDINGS.md` and does not
+require further work.
