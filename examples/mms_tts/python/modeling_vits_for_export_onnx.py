@@ -23,16 +23,13 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 
-from ...activations import ACT2FN
-from ...integrations.deepspeed import is_deepspeed_zero3_enabled
-from ...modeling_attn_mask_utils import _prepare_4d_attention_mask
-from ...modeling_outputs import (
-    BaseModelOutput,
-    ModelOutput,
-)
-from ...modeling_utils import PreTrainedModel
-from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
-from .configuration_vits import VitsConfig
+from transformers.activations import ACT2FN
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
+from transformers.modeling_outputs import BaseModelOutput, ModelOutput
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
+from transformers.models.vits.configuration_vits import VitsConfig
 
 
 logger = logging.get_logger(__name__)
