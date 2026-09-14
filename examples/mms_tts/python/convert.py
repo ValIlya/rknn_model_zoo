@@ -40,8 +40,8 @@ if __name__ == '__main__':
     # Pre-process config
     print('--> Config model')
     if 'encoder' in model_path:
-        op_target = {'7398-rs':'cpu', '5773-rs':'cpu'}
-        rknn.config(target_platform=platform, op_target=op_target)
+        op_target = {'/text_encoder/encoder/Where':'cpu', '/text_encoder/encoder/Where_1':'cpu'}
+        rknn.config(target_platform=platform)
     else:
         rknn.config(target_platform=platform)
     print('done')

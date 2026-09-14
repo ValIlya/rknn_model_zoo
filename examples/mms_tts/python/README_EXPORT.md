@@ -35,6 +35,9 @@ This repository contains a small helper script to export the MMS TTS example fro
 4. **Convert to RKNN** (optional)
    Use the provided `convert.py` script to convert the ONNX files to RKNN format:
    ```bash
+   sudo apt-get update && sudo apt-get install -y build-essential cmake protobuf-compiler libprotobuf-dev
+   sudo apt-get install -y python3.10-dev
+   sudo apt-get install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
    python3 convert.py --encoder ../model/mms_tts_eng_encoder_200.onnx \
                      --decoder ../model/mms_tts_eng_decoder_200.onnx \
                      --output_dir ../model
