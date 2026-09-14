@@ -1,93 +1,128 @@
-Context: I'm converting a VITS-based MMS-TTS model (facebook/mms-tts-eng) to RKNN 
-format for Rockchip RK3588 NPU inference, using rknn-toolkit2 v2.3.2 and the 
-conversion script at rknn_model_zoo/examples/mms_tts/python/convert.py + 
-mms_tts.py. The encoder ONNX model was exported via a patched HuggingFace 
-transformers VitsModel (modeling_vits_for_export_onnx.py from rknn_model_zoo).
+Context: I'm converting the MMS-TTS encoder (facebook/mms-tts-eng, exported as
+mms_tts_eng_encoder_200.onnx via the patched modeling_vits_for_export_onnx.py)
+to RKNN for RK3588 NPU inference. Toolchain: rknn-toolkit2==2.3.2, venv
+.rknn_venv (torch==2.2.0, onnx==1.16.1, onnxruntime==1.23.2), scripts at
+rknn_model_zoo/examples/mms_tts/python/convert.py + mms_tts.py, target
+platform rk3588 (Orange Pi 5).
 
-Problem: When comparing encoder outputs between the ONNX model (onnxruntime, 
-ground truth) and the RKNN-converted model (RKNNLite/RKNN on-device inference) 
-for the *same* text input, on the *same* RK3588 device:
-  - input_padding_mask: max_abs_diff = 0.0000 (perfect match)
-  - log_duration: max_abs_diff = 2.4481, mean_abs_diff = 0.6801 (BAD)
-  - prior_means: max_abs_diff = 2.09-2.21, mean_abs_diff = 0.005-0.05 (mostly OK, 
-    but has occasional large outliers)
-  - prior_log_variances: max_abs_diff = 0.22-0.38, mean_abs_diff = 0.0003-0.003 
-    (small, likely acceptable)
+Some paths:
+On this machine: 
+- `~/code/rknn_model_zoo/` - current main branch + my extra changes for  `examples/mms_tts/python/convert.py`
+- `examples/mms_tts/prompt.md` - this prompt if you need it
+- `examples/mms_tts/python/softplus_fix.md` - results of previous agent run
 
-This numerical divergence in log_duration causes the final synthesized audio to 
-have correct pitch and overall duration/length, but with word chunks/phonemes 
-scrambled/out of order — the alignment computed from log_duration (via the 
-attn matrix in middle_process()) is wrong, even though the total predicted 
-length stays similar.
+on orange pi 
+- `~/rknn_model_zoo/` - is synced with local
+- `~/rknn_model_zoo/examples/mms_tts/python/.rknn_venv` - virtialenv with all the reqirements installed
 
-Setting rknn.config(optimization_level=0) made ZERO difference (identical 
-diffs to optimization_level=3 default), which rules out standard graph fusion/
-constant-folding as the cause.
+You can run tests like this
+```
+scp convert.py orange_pi:~/rknn_model_zoo/examples/mms_tts/python/
+ssh orange_pi 'cd ~/rknn_model_zoo/examples/mms_tts/python/  && source .rknn_venv/bin/activate && python convert.py ../model/mms_tts_eng_encoder_200.onnx rk3588 fp'.
+```
 
-I need you to investigate WHY log_duration diverges so much more than the 
-other three outputs. Please:
+Known problem: comparing ONNX (onnxruntime, ground truth) vs RKNN
+(RKNNLite on-device) outputs for the SAME input on the SAME device:
+- input_padding_mask: max_abs_diff = 0.0000
+- log_duration: max_abs_diff = 2.4481, mean_abs_diff = 0.6801  <- broken
+- prior_means: max_abs_diff = 2.09-2.21, mean_abs_diff = 0.005-0.05
+- prior_log_variances: max_abs_diff = 0.22-0.38, mean_abs_diff = 0.0003-0.003
 
-1. Locate the ONNX graph nodes that produce log_duration specifically — trace 
-   backward from the "log_duration" output tensor through the duration_predictor 
-   subgraph (stochastic duration predictor, piecewise rational quadratic spline 
-   flows named /duration_predictor/flows.0 through flows.5 or similar in the 
-   graph). Identify which ops sit on this path that DON'T sit on the path to 
-   prior_means/prior_log_variances (which are comparatively much more accurate).
+A previous investigation attempt produced an UNVERIFIED claim that mapping
+`Where` and `Expand` ops to CPU via `rknn.config(op_target={'Where':'cpu',
+'Expand':'cpu'})` fixes log_duration. That claim is NOT trusted — the code
+shown didn't match the reported results, the output index used didn't match
+log_duration, and no real before/after comparison was run. Do not reuse or
+assume that conclusion. Start from scratch.
 
-2. In the RKNN build verbose log (rebuild with rknn.config(verbose=True, 
-   verbose_file='...')), search for any node fusion/rewrite specifically 
-   touching Softplus, Exp, Where, Equal, ConstantOfShape, ScatterND, Range, 
-   Gather, or Cumsum ops within the duration_predictor/flows.* subgraphs. 
-   Pay special attention to entries like "unsqueeze_to_4d_softplus" or 
-   "bypass_two_reshape" that rewrite Softplus/Squeeze sequences — these look 
-   suspicious because Softplus normalizes spline "bin widths/heights" in VITS's 
-   stochastic duration predictor, and any precision loss there would directly 
-   distort log_duration.
+## Hard requirements — read before doing anything
 
-3. Check whether RKNN is silently running any of these ops in reduced 
-   precision (fp16 instead of fp32) even with do_quantization=False — RKNN 
-   NPU compute is natively fp16, and ops NOT explicitly forced to CPU run in 
-   NPU fp16, which can be enough to disturb a stochastic sampling / cumulative 
-   sum pipeline like this one. Look for a way to force the duration_predictor 
-   subgraph nodes onto CPU (fp32) via rknn.config(op_target={...}), and 
-   identify the correct *current* internal node names for this graph (not the 
-   old '7398-rs'/'5773-rs' from the original rknn_model_zoo script, which don't 
-   exist in this exported graph — confirmed by testing, they raised 
-   "Invalid key" errors).
+1. **No number without a command that produced it.** Every diff value,
+   tensor shape, or node name you report must come from a command you
+   actually ran in this session. Paste the exact command AND its raw stdout
+   immediately after each claim. If you didn't run something, say
+   "NOT VERIFIED" instead of guessing a plausible number.
+2. **No code/result mismatch.** If you show a code block as "the fix," its
+   printed output in your log must come from running THAT EXACT code block,
+   not a variant of it. Never show baseline code paired with post-fix
+   numbers.
+3. **Confirm tensor identity before measuring it.** Before comparing
+   "log_duration", dump the ONNX graph output names (`onnx.load(path).graph.output`
+   — print name + index for all 4 outputs) and confirm which index
+   corresponds to log_duration by name, not by guessing position. Do the
+   same for the RKNN model's output ordering (`rknn.load_onnx` /
+   `rknn.list_outputs()` or equivalent) — RKNN does not guarantee it
+   preserves ONNX output order.
+4. **Every referenced file must exist and be shown to exist.** If you
+   create an intermediate ONNX file (e.g. a version with nodes stripped),
+   run `ls -la` on it and include the file size/timestamp in your report.
+   Never reference a file you didn't create in this session.
 
-4. As a diagnostic, write a small script that runs BOTH onnxruntime and RKNN 
-   inference on the same input, but instead of just comparing the 4 final 
-   outputs, use rknn.accuracy_analysis() (if available in this rknn-toolkit2 
-   version) or manually extract intermediate tensor values layer-by-layer 
-   within the duration_predictor subgraph, to find the earliest point in the 
-   graph where RKNN's numerical output starts diverging meaningfully from 
-   ONNX's. This will pinpoint the exact problematic op instead of guessing.
+## What I actually need you to do
 
-5. Cross-check torch/transformers version sensitivity: the ONNX export was 
-   done with torch==2.2.0 (or 2.4.1, inconsistent installs happened during 
-   setup) and transformers==4.39.3, whereas the original rknn_model_zoo 
-   MMS-TTS example may have been validated against older torch (~1.10-1.13). 
-   Check the export patch file (modeling_vits_for_export_onnx.py) for any 
-   version-sensitive tensor ops (e.g. torch.cumsum, searchsorted-like logic in 
-   the spline flow) that could produce a subtly different ONNX graph structure 
-   depending on torch version, which RKNN then handles differently than 
-   onnxruntime does.
+1. **Trace the graph.** Using `onnx.load` + `onnx.helper.printable_graph`
+   (or netron export to text), find the subgraph that produces the
+   log_duration output specifically. Walk backward from that output node
+   until you reach the shared trunk (where it merges with the path to
+   prior_means/prior_log_variances). List every op type on the
+   log_duration-exclusive path (expect things like Softplus, Cumsum, Where,
+   ScatterND, ConstantOfShape, Range, Gather — but report what's ACTUALLY
+   there, not what I expect). Paste the actual node list (names + op types),
+   not a paraphrase.
 
-Repository/paths for reference:
-- Model: rknn_model_zoo/examples/mms_tts/python/
-- README_EXPORT.md - instructions
-- convert_to_rknn.sh high-level installation+conversion
-- convert.py (conversion), mms_tts.py (inference/test script)
-- ONNX models: ../model/mms_tts_eng_encoder_200.onnx, ../model/mms_tts_eng_decoder_200.onnx
-- RKNN models: ../model/mms_tts_eng_encoder_200.rknn
-- Venv: .rknn_venv (rknn-toolkit2==2.3.2, torch==2.2.0, onnx==1.16.1, onnxruntime==1.23.2)
-- Target platform: rk3588 (Orange Pi 5, RK3588 SoC)
+2. **Get the RKNN build's verbose log.** Rebuild with
+   `rknn.config(verbose=True, verbose_file='/tmp/rknn_build.log')` and grep
+   that log file for any fusion/rewrite touching the op types found in step 1
+   inside the duration_predictor subgraph. Paste the exact matching log
+   lines (grep output), not a summary.
 
-Try to fix: (a) the exact ops on the log_duration-only path, (b) any 
-RKNN-side rewrite/precision issue found on that path, (c) a concrete fix — 
-either op_target CPU-forcing with correct node names, a different opset/export 
-setting, or a torch/transformers version pin — with instructions to verify the 
-fix numerically (re-run the ONNX-vs-RKNN diff comparison and confirm 
-log_duration mean_abs_diff drops to the same order of magnitude as 
-prior_log_variances, i.e. < 0.01).
-Feel free to ask if stuck.
+3. **Run a real accuracy_analysis.** Check if
+   `rknn.accuracy_analysis(inputs=[...], target=...)` exists in
+   rknn-toolkit2==2.3.2 (check via `dir(RKNN)` or the installed package's
+   API docs) and run it if available. Paste the actual per-layer output it
+   produces, especially the first layer where NPU vs "golden" simulator
+   values diverge beyond ~1e-2. If unavailable, say so explicitly and fall
+   back to step 4.
+
+4. **Manual bisection fallback (only if step 3 unavailable).** Export a
+   truncated ONNX graph that ends at progressively deeper points along the
+   log_duration path (e.g. using `onnx.utils.extract_model` with different
+   output node names), convert each truncated graph to RKNN, and diff
+   against onnxruntime run on the same truncated graph. Report the diff at
+   EACH truncation point in a table, so the exact op where divergence first
+   exceeds ~1e-2 is identified. Show the extraction code, the conversion
+   command, and the diff numbers for every truncation point — not just the
+   final one.
+
+5. **Test the actual fix, not a hypothesis.** Once you've identified the
+   specific node(s) or op(s) responsible (from steps 2-4, not from assumption),
+   apply `op_target` targeting ONLY those specific node names (get exact
+   names via `rknn.list_devices()` or graph dump — do not use op-type-level
+   keys like `'Where': 'cpu'` unless you've confirmed op_target in this
+   rknn-toolkit2 version actually accepts op-type keys and not just node
+   names; verify this by checking the API signature/docs directly). Then run
+   ONE script that does both baseline and fixed inference back-to-back on
+   the identical input, printing both diffs together, so before/after is
+   directly comparable in a single output block.
+
+6. **Version sensitivity check.** Confirm what torch/transformers version
+   was actually used for the ONNX export currently on disk — check via
+   `pip show torch transformers` in the export venv (not this conversion
+   venv), and check the ONNX file's producer metadata
+   (`onnx.load(path).producer_version` / opset imports) to see if it's
+   consistent with modeling_vits_for_export_onnx.py's expectations. Report
+   what you actually find; don't speculate about version mismatches without
+   checking.
+
+## Deliverable format
+
+For each of the 6 steps above: command run -> raw output pasted -> your
+interpretation, clearly separated. End with:
+- (a) exact op(s)/node name(s) confirmed responsible, with the specific
+  evidence line that proves it (not inferred)
+- (b) the exact op_target config that fixes it, with node names verified to
+  exist in this graph
+- (c) one single before/after script + its actual output showing
+  log_duration mean_abs_diff dropping to <0.01, run in this session
+- (d) an honest list of anything from steps 1-6 you could NOT verify, rather
+  than filling gaps with plausible-sounding claims
