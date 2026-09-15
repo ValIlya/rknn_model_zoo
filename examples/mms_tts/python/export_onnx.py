@@ -97,7 +97,7 @@ if __name__ == '__main__':
                         help='input length of encoder model, default is 200')
     args = parser.parse_args()
 
-    model, tokenizer = setup_model("facebook/mms-tts-eng")
+    model, tokenizer = setup_model("facebook/mms-tts-rus")
 
     text = "some example text in the English language"
     inputs = tokenizer(text, return_tensors="pt", padding="max_length", max_length=args.max_length, truncation=True)
@@ -127,8 +127,8 @@ if __name__ == '__main__':
     padded_indices = valid_indices - nn.functional.pad(valid_indices, [0, 0, 1, 0, 0, 0])[:, :-1]
     attn = padded_indices.unsqueeze(1).transpose(2, 3) * attn_mask
     
-    save_encoder_model_path = "../model/mms_tts_eng_encoder_{}.onnx".format(args.max_length)
-    save_decoder_model_path = "../model/mms_tts_eng_decoder_{}.onnx".format(args.max_length)
+    save_encoder_model_path = "../model/mms_tts_rus_encoder_{}.onnx".format(args.max_length)
+    save_decoder_model_path = "../model/mms_tts_rus_decoder_{}.onnx".format(args.max_length)
     torch.onnx.export( 
         model,
         (input_ids, attention_mask),

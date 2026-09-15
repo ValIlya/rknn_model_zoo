@@ -13,8 +13,8 @@ DTYPE=${2:-fp}
 # Paths
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODEL_DIR="$BASE_DIR/../model"
-ENCODER_ONNX="$MODEL_DIR/mms_tts_eng_encoder_200.onnx"
-DECODER_ONNX="$MODEL_DIR/mms_tts_eng_decoder_200.onnx"
+ENCODER_ONNX="$MODEL_DIR/mms_tts_rus_encoder_200.onnx"
+DECODER_ONNX="$MODEL_DIR/mms_tts_rus_decoder_200.onnx"
 
 # Create a virtual environment
 VENV_DIR="$BASE_DIR/.rknn_venv"
